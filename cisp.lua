@@ -19,18 +19,20 @@ TT_STRING = 0
 TT_NAME = 1
 TT_NUMBER = 2
 TT_LIST = 3
+TT_INDEX = 4
+TT_TABLE = 5
+TT_ARRAY = 6
 TT_EMPTY = -1
 
 local function makeTK(typ, val)
-    if typ == TT_LIST then
+    if typ >= TT_LIST then
         local t = val
         t.count = #val
         t.type = typ
+        t.col, t.row = state.col, state.row
         return t
     else
-        return setmetatable({type = typ, value = val}, {__call = function (self)
-            return self.value
-        end})
+        return {type = typ, value = val, row = state.row, col = state.col}
     end
 end
 
@@ -74,9 +76,9 @@ local function isComment()
     return cur == ';' and (nex == cur or nex == ':')
 end
 
-local function isNumber(c)
+local function isNumber(c, nex)
     return (c >= '0' and c <= '9') or
-    (c == '+' or c == '-' or c == '.')
+    ((c == '+' or c == '-' or c == '.') and (nex >= '0' and nex <= '9'))
 end
 
 local function isQuote(c)
@@ -132,6 +134,11 @@ local function skipComment()
 end
 
 local function readString()
+    local isName = false
+    if current() == "!" then
+        isName = true
+        next()
+    end
     local str, sign = "", next()
     local msg = "Missing " .. sign
     while current() ~= sign do
@@ -146,12 +153,37 @@ local function readString()
         str = str .. char
     end
     next()
-    return makeTK(TT_STRING, str)
+    if isName then
+        return makeTK(TT_NAME, str)
+    else
+        return makeTK(TT_STRING, str)
+    end
 end
+
+local signs = {
+    ["("] = ")",
+    ["["] = "]",
+    ["{"] = "}",
+    ["<"] = ">"
+}
+
+local signInversed = {
+    [")"] = "(",
+    ["]"] = "[",
+    ["}"] = "{",
+    [">"] = "<"
+}
+
+local signType = {
+    ["("] = TT_LIST,
+    ["["] = TT_INDEX,
+    ["{"] = TT_TABLE,
+    ["<"] = TT_ARRAY
+}
 
 local function readName()
     local str = ""
-    while notEnd() and isWS(current()) == false and current() ~= ")" do
+    while notEnd() and isWS(current()) == false and signInversed[current()] == nil do
         str = str .. next()
     end
     if str:sub(1, 1) == "@" then
@@ -166,7 +198,7 @@ local function readNumber()
         str = str .. next()
     end
     local num = tonumber(str)
-    ast(num, "Can't convert to number")
+    ast(num, ("Can't convert %s to number"):format(str))
     return makeTK(TT_NUMBER, num)
 end
 
@@ -181,10 +213,10 @@ local function skipBad()
 end
 
 local function readNext()
-    local cur, nex = current(), lookahead()
+    local cur = current()
     if isQuote(cur) then
         return readString()
-    elseif isNumber(cur) and nex ~= "." then
+    elseif isNumber(cur, lookahead()) then
         return readNumber()
     else
         return readName()
@@ -193,27 +225,28 @@ end
 
 local function readList()
     local t = {}
-    next()
-    while current() ~= ")" do
+    local sign = next()
+    local endSign = signs[sign]
+    while current() ~= endSign do
         skipBad()
         if not notEnd() then break end
-        if current() == ")" then break end
+        if current() == endSign then break end
         local c = current()
         local v
-        if c == "(" then
+        if signs[c] then
             v = readList()
         else
             v = readNext()
         end
         t[#t + 1] = v
-        if current() == ")" or not notEnd() then break end
-        ast(isWS(current()), "Missing separate")
+        if current() == endSign or false == notEnd() then break end
+        ast(isWS(current()), "Missing separate character")
     end
     next()
-    return makeTK(TT_LIST, t)
+    return makeTK(signType[sign] or TT_EMPTY, t)
 end
 
-local function parse(s)
+local parse = function (s)
     newState("(" .. s .. ")")
     return readList()
 end
@@ -242,8 +275,14 @@ end
 
 local function look()
     local v = node[index]
-    ast(v, "Got nil")
+    assert(v, "Got nil")
     return v
+end
+
+local function cAst(b, msg)
+    local tk = node[index] or node[index-1]
+    local rmsg = (msg or "Error") .. (" At Row: %d, Column: %d"):format(tk.row, tk.col)
+    assert(b, rmsg)
 end
 
 local function eat()
@@ -253,12 +292,12 @@ local function eat()
 end
 
 local binOper = {
-    ["add"] = '+',
-    ["sub"] = '-',
-    ["mul"] = '*',
-    ["div"] = '/',
-    ["mod"] = '%',
-    ["pow"] = '^',
+    ["+"] = '+',
+    ["-"] = '-',
+    ["*"] = '*',
+    ["/"] = '/',
+    ["%"] = '%',
+    ["^"] = '^',
     ["eq"] = '==',
     ["neq"] = '~=',
     ["ge"] = '>=',
@@ -316,41 +355,45 @@ local kwList = {
 }
 
 local stmtTemp = {
-    ["if"] = "if {expr} then {stmt}{ else <stmt>} end",
-    ["while"] = "while {expr} do {stmt} end",
-    ["for"] = "for {name} = {val}, {val}{, <val>} do {stmt} end",
-    ["repeat"] = "repeat {stmt} until {expr}",
-    ["func"] = "{code} = function ({arg}) {stmt} end",
-    ["lfunc"] = "local function ({arg}) {stmt} end",
-    ["localfunc"] = "local {code} = function ({arg}) {stmt} end",
+    ["if"] = "if {expr} then\n {stmt}{ \nelse\n <stmt>}\n end",
+    ["while"] = "while {expr} do\n {stmt}\n end",
+    ["for"] = "for {name} = {val}, {val}{, <val>} do\n {stmt}\n end",
+    ["repeat"] = "repeat\n {stmt}\n until {expr}",
+    ["func"] = "{code} = function ({arg})\n {stmt}\n end",
+    ["lfunc"] = "local function ({arg})\n {stmt}\n end",
+    ["localfunc"] = "local {code} = function ({arg})\n {stmt}\n end",
     ["def"] = "{code} = {code}",
     ["localdef"] = "local {code} = {code}",
-    ["index"] = "{name}{idx}",
-    ["forin"] = "for {arg} in {name}({arg}) do {stmt} end",
+    --["index"] = "{name}{idx}",
+    ["forin"] = "for {arg} in {name}({arg}) do\n {stmt}\n end",
     ["break"] = "break",
     ["return"] = "return {array}",
-    ["list"] = "{list}",
-    ["array"] = "{array}",
-    ["do"] = "do {stmt} end",
+    --["list"] = "{list}",
+    --["array"] = "{array}",
+    ["do"] = "do\n {stmt}\n end",
     ["_"] = "{code}({<array>})",
+    ["multdef"] = "{arg} = {array}",
+    ["multldef"] = "local {arg} = {array}",
+    ["nfunc"] = "function ({arg})\n {stmt}\n end",
+    ["inv"] = "-{expr}",
+    ["luaexpr"] = "{code}"
 }
 
---[[local extra = require("extraGrammar")
-for k, v in pairs(extra) do
-    stmtTemp[k] = v
-end]]
+TEMP_TABLE = "{list}"
+TEMP_ARRAY = "{array}"
+TEMP_INDEX = "{name}{idx}"
 
 local function isBin(c)
     return binOper[c] ~= nil
 end
 
 local function getBin(c)
-    ast(isBin(c))
+    cAst(isBin(c))
     return binOper[c]
 end
 
 local function getUnr(c)
-    ast(not isBin(c))
+    cAst(not isBin(c))
     return unrOper[c]
 end
 
@@ -383,32 +426,34 @@ local function isOper(c)
     return (binOper[c] or unrOper[c]) ~= nil
 end
 
-local t = {
-    replace = function (self, fstr)
+local compiler
+
+compiler = {
+    replace = function (fstr)
         local str = fstr:sub(2, -2)
         if str == "expr" then
-            return self:compileExprTo(eat())
+            return compiler.compileExprTo(eat())
         elseif str == "stmt" then
             local r = ""
             local stmt = eat()
             for i = 1, stmt.count do
-                r = r .. self:compileStmtTo(stmt[i])
+                r = r .. compiler.compileStmtTo(stmt[i])
             end
             return r
         elseif str == "code" then
-            return self:compileLineTo(eat())
+            return compiler.compileLineTo(eat())
         elseif str == "val" then
             return tostring(eat().value)
         elseif str == "name" then
             local n = eat().value
-            assert(n, "Need name, got code")
+            cAst(n, "Need name, got code")
             return n
         elseif str == "arg" then
             local tp = eat()
             local r = {}
             for i = 1, tp.count do
                 local n = tp[i].value
-                assert(n, "Need name, got code")
+                cAst(n, "Need name, got code")
                 r[#r + 1] = n
             end
             return table.concat(r, ", ")
@@ -416,7 +461,7 @@ local t = {
             local r = {}
             while node[index] do
                 local tk = eat()
-                local s = self:compileLineTo(tk)
+                local s = compiler.compileLineTo(tk)
                 if tk.type == TT_STRING or tostring(tk.value):find(" ") then
                     s = s
                 end
@@ -425,24 +470,24 @@ local t = {
             return "[" .. table.concat(r, "][") .. "]"
         elseif str == "list" then
             local r = {}
-            assert((#node-1) % 2 == 0, "Too less arguments")
-            for i = 2, #node-1, 2 do
-                r[#r + 1] = "[\"" .. self:compileLineTo(node[i]) .. "\"]" .. " = " .. self:compileLineTo(node[i+1])
+            cAst(node.count % 2 == 0, "Too less arguments")
+            for i = 1, node.count - 1, 2 do
+                r[#r + 1] = "[\"" .. compiler.compileLineTo(node[i]) .. "\"]" .. " = " .. compiler.compileLineTo(node[i+1])
             end
             return table.concat(r, ", ")
         elseif str == "array" then
             local r = {}
             while node[index] do
                 local tk = eat()
-                local s = self:compileLineTo(tk)
+                local s = compiler.compileLineTo(tk)
                 r[#r + 1] = s
             end
             return table.concat(r, ", ")
         else
-            assert(str:find("<"), "Missing code")
+            cAst(str:find("<"), "Missing code")
             if node[index] then
                 local r = str:gsub("<[^>]+>", function (fstr)
-                    local r = self:replace(fstr)
+                    local r = compiler.replace(fstr)
                     return r
                 end)
                 return r
@@ -450,34 +495,42 @@ local t = {
             return ""
         end
     end,
-    compileExprTo = function (self, tk)
+    compileExprTo = function (tk)
         local ln, n, idx = copy(lastNode), copy(node), index
         newNode(tk)
-        local r = self:exprToCode()
+        local r = compiler.exprToCode()
         lastNode = ln
         node = n
         index = idx
         return r
     end,
-    compileStmtTo = function (self, tk)
+    compileStmtTo = function (tk)
         local ln, n, idx = copy(lastNode), copy(node), index
         newNode(tk)
-        local r = self:stmtToCode()
+        local r = compiler.stmtToCode()
         lastNode = ln
         node = n
         index = idx
         return r
     end,
-    compileLineTo = function (self, tk)
-        if tk.type == TT_LIST then
+    compileLineTo = function (tk)
+        if tk.type >= TT_LIST then
             local ln, n, idx = copy(lastNode), copy(node), index
             newNode(tk)
             local r
-            local tv = tk[1].value
-            if isOper(tv) then
-                r = self:exprToCode()
+            if tk.type == TT_TABLE then
+                r = "{" .. compiler.split(TEMP_TABLE) .. "}"
+            elseif tk.type == TT_ARRAY then
+                r = "{" .. compiler.split(TEMP_ARRAY) .. "}"
+            elseif tk.type == TT_INDEX then
+                r = compiler.split(TEMP_INDEX)
             else
-                r = self:stmtToCode()
+                local tv = tk[1].value
+                if isOper(tv) then
+                    r = compiler.exprToCode()
+                else
+                    r = compiler.stmtToCode()
+                end
             end
             lastNode = ln
             node = n
@@ -493,17 +546,17 @@ local t = {
             return tk.value
         end
     end,
-    exprToCode = function (self)
+    exprToCode = function ()
         local sign = eat()
         local rs = ""
-        ast(sign.type == TT_NAME)
+        cAst(sign.type == TT_NAME)
         local sv = sign.value
         if isBin(sv) then
-            local l = self:compileLineTo(eat())
-            local r = self:compileLineTo(eat())
+            local l = compiler.compileLineTo(eat())
+            local r = compiler.compileLineTo(eat())
             rs = table.concat({l, getBin(sv), r}, ' ')
         else
-            rs = table.concat({getUnr(sv), self:compileLineTo(eat())})
+            rs = table.concat({getUnr(sv), compiler.compileLineTo(eat())})
         end
         local spri = getOperPrty(getOper(sv))
         local lpri = getOperPrty(getOper(lastNode[1].value))
@@ -512,7 +565,14 @@ local t = {
         end
         return rs
     end,
-    stmtToCode = function (self)
+    split = function (temp)
+        local r = temp:gsub("{[^}]+}", function (fstr)
+            local r = compiler.replace(fstr)
+            return r
+        end)
+        return r
+    end,
+    stmtToCode = function ()
         local sign = look().value
         local temp = stmtTemp[sign]
         if not temp then
@@ -520,27 +580,33 @@ local t = {
         else
             eat()
         end
-        local r = temp:gsub("{[^}]+}", function (fstr)
-            local r = self:replace(fstr)
-            return r
-        end)
+        local r = compiler.split(temp)
         if sign == "list" or sign == "array" then
             r = "{" .. r .. "}"
         end
         return r .. " "
     end,
-    compile = function (self, str)
-        local n = parse(str)
+    compile = function (str)
+        local linePos = str:find("%$", 2)
+        local luaPath = str:sub(2, (linePos or 2) - 1)
+        local rstr = str:sub(linePos + 1)
+        local n = parse(rstr)
         local r = {}
         for i = 1, #n do
-            r[#r + 1] = self:compileLineTo(n[i])
+            r[#r + 1] = compiler.compileLineTo(n[i])
         end
-        return table.concat(r)
+        return table.concat(r, "\n"), luaPath
     end,
-    compileFromFile = function (self, name)
+    compileFromFile = function (name)
         local f = io.open(name, "r")
-        local r = self:compile(f:read"*a")
+        local r, path = compiler.compile(f:read"*a")
         f:close()
-        return r
+        return r, path
     end
 }
+
+local lua, path = compiler.compileFromFile("test.cisp")
+print(lua)
+local file = io.open(path, "w")
+file:write(lua)
+file:close()

@@ -1,0 +1,13 @@
+$test.lua$
+
+(localdef tbl <"A" "B" "C">)
+(print (table.concat tbl))
+
+(localdef tbl {
+    x 10
+    
+    foo (nfunc (self x)
+        (+ self.x x)
+    )
+})
+(print (tbl..foo 20))

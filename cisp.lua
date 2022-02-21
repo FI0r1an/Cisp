@@ -1,294 +1,292 @@
-local function newState(s)
-    _G.state = {
-        source = s,
+local state
+
+local function newState(s, fn)
+    state = {
+        src = s,
+        fileName = fn or "*",
         idx = 1,
         row = 1,
-        col = 1
+        col = 1,
     }
 end
 
-local escapeChar = {
-    ["\\r"] = "\\r",
-    ["\\n"] = "\\n",
-    ["\\t"] = "\\t",
-    ["\\'"] = '\"',
-    ['\\"'] = "\'"
-}
-
-TT_STRING = 0
-TT_NAME = 1
-TT_NUMBER = 2
-TT_LIST = 3
-TT_INDEX = 4
-TT_TABLE = 5
-TT_ARRAY = 6
-TT_EMPTY = -1
-
-local function makeTK(typ, val)
-    if typ >= TT_LIST then
-        local t = val
-        t.count = #val
-        t.type = typ
-        t.col, t.row = state.col, state.row
-        return t
-    else
-        return {type = typ, value = val, row = state.row, col = state.col}
-    end
+local function isNum(c)
+    return c >= '0' and c <= '9'
 end
 
-local function ast(b, msg)
-    local rmsg = (msg or "Error") .. (" At Row: %d, Column: %d"):format(state.row, state.col)
-    assert(b, rmsg)
+local function lcurr()
+    return string.sub(state.src, state.idx, state.idx)
 end
 
-local function current()
-    local idx = state.idx
-    return state.source:sub(idx, idx)
-end
-
-local function lookahead()
+local function llookahead()
     local idx = state.idx + 1
-    return state.source:sub(idx, idx)
+    return string.sub(state.src, idx, idx)
 end
 
-local function next()
-    local idx, col = state.idx, state.col
-    local old = current()
-    state.idx = idx + 1
-    state.col = col + 1
-    return old
+local function lnext()
+    local rsl = lcurr()
+
+    state.idx = state.idx + 1
+    state.col = state.col + 1
+    return rsl
 end
 
-local function isLine(c)
-    return c == '\r' or c == '\n'
-end
+local function inclinenumber()
+    local cur = lcurr()
 
-local function isSpace(c)
-    return c == ' ' or c == '\t'
-end
+    if cur == '\r' or cur == '\n' then
+        local nex = llookahead()
 
-local function isWS(c)
-    return isSpace(c) or isLine(c)
-end
+        if (nex == '\r' or nex == '\n') and cur ~= nex then
+            lnext()
+        end
 
-local function isComment()
-    local cur, nex = current(), lookahead()
-    return cur == ';' and (nex == cur or nex == ':')
-end
+        lnext()
+    end
 
-local function isNumber(c, nex)
-    return (c >= '0' and c <= '9') or
-    ((c == '+' or c == '-' or c == '.') and (nex >= '0' and nex <= '9'))
-end
-
-local function isQuote(c)
-    return c == "'" or c == '"'
-end
-
-local function nextRow()
     state.row = state.row + 1
-end
-
-local function resetCol()
     state.col = 1
 end
 
-local function skipWS()
-    while isWS(current()) do
-        local old = next()
-        if isLine(old) then
-            local cur = current()
-            if isLine(cur) and cur ~= old then
-                next()
-            end
-            nextRow()
-            resetCol()
-        end
-    end
-end
+local TT_STRING = 0
+local TT_NAME = 1
+local TT_NUMBER = 2
+local TT_LIST = 3
+local TT_INDEX = 4
+local TT_TABLE = 5
+local TT_TUPLE = 6
+local TT_EOF = -1
 
-local function notEnd()
-    return state.idx <= #state.source
-end
+local abort = false
 
-local function skipComment()
-    next()
-    local sign = next()
-    if sign == ';' then
-        while not isLine(current()) do next() end
-        return
-    end
-    while current() ~= ':' and lookahead() ~= ';' do
-        ast(notEnd(), "Missing :;")
-        local old = next()
-        if isLine(old) then
-            local cur = current()
-            if isLine(cur) and cur ~= old then
-                next()
-            end
-            nextRow()
-            resetCol()
-        end
-    end
-    next(); next()
-end
-
-local function readString()
-    local isName = false
-    if current() == "!" then
-        isName = true
-        next()
-    end
-    local str, sign = "", next()
-    local msg = "Missing " .. sign
-    while current() ~= sign do
-        ast(notEnd(), msg)
-        local char = next()
-        local nex = current()
-        local e = escapeChar[char .. nex]
-        if e then
-            char = e
-            next()
-        end
-        str = str .. char
-    end
-    next()
-    if isName then
-        return makeTK(TT_NAME, str)
+local function cerror(msg, row, col, ...)
+    if col then
+        print(string.format("[%s %d:%d] %s", state.fileName, row, col, msg:format(...)))
     else
-        return makeTK(TT_STRING, str)
+        print(string.format("[%s %d] %s", state.fileName, row, msg:format(...)))
     end
+
+    abort = true
 end
 
-local signs = {
-    ["("] = ")",
-    ["["] = "]",
-    ["{"] = "}",
-    ["<"] = ">"
-}
+local function readString(rsl)
+    local val, sign = "", lnext()
 
-local signInversed = {
-    [")"] = "(",
-    ["]"] = "[",
-    ["}"] = "{",
-    [">"] = "<"
-}
+    while lcurr() ~= sign do
+        local cur = lcurr()
+        if cur == '' then
+            cerror("Expected '%s'", rsl.row, rsl.col, sign)
+            break
+        end
 
-local signType = {
-    ["("] = TT_LIST,
-    ["["] = TT_INDEX,
-    ["{"] = TT_TABLE,
-    ["<"] = TT_ARRAY
-}
-
-local function readName()
-    local str = ""
-    while notEnd() and isWS(current()) == false and signInversed[current()] == nil do
-        str = str .. next()
-    end
-    if str:sub(1, 1) == "@" then
-        return makeTK(TT_STRING, str:sub(2))
-    end
-    return makeTK(TT_NAME, str)
-end
-
-local function readNumber()
-    local str = ""
-    while notEnd() and isNumber(current()) do
-        str = str .. next()
-    end
-    local num = tonumber(str)
-    ast(num, ("Can't convert %s to number"):format(str))
-    return makeTK(TT_NUMBER, num)
-end
-
-local function skipBad()
-    while isWS(current()) or isComment() do
-        if isWS(current()) then
-            skipWS()
+        val = val .. cur
+        if cur == '\r' or cur == '\n' then
+            inclinenumber()
         else
-            skipComment()
+            lnext()
+        end
+    end
+
+    lnext()
+
+    rsl.typ = TT_STRING
+    rsl.val = val
+
+    return rsl
+end
+
+local function isalpha(c)
+    return c == '_' or (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+end
+
+local tkNext
+
+local function readName(rsl)
+    local val = lnext()
+    local cur = lcurr()
+    local meetDot = false
+
+    while isalpha(cur) or (cur >= '0' and cur <= '9') or cur == '.' do
+        if meetDot then
+            if cur >= '0' and cur <= '9' then
+                cerror("Unexpected character '%s'", state.row, state.col, cur)
+                return rsl
+            else
+                meetDot = false
+            end
+        end
+
+        if cur == '.' then
+            meetDot = true
+            if llookahead() == cur then
+                lnext()
+                cur = ':'
+            end
+        end
+        
+        val = val .. cur
+
+        lnext()
+        cur = lcurr()
+    end
+    
+    rsl.typ = TT_NAME
+    rsl.val = val
+
+    return rsl
+end
+
+local function readNumber(rsl)
+    local val = lnext()
+    local meetPoint = val == '.'
+    local cur = lcurr()
+
+    while cur == '.' or cur >= '0' and cur <= '9' do
+        if cur == '.' then
+            if meetPoint then
+                cerror("Unexpected character '.'", state.row, state.col)
+                return rsl
+            end
+            meetPoint = true
+        end
+
+        val = val .. cur
+        lnext()
+        cur = lcurr()
+    end
+
+    rsl.typ = TT_NUMBER
+    rsl.val = tonumber(val)
+    if not rsl.val then
+        cerror("Unrecognized number \"%s\"", rsl.row, rsl.col, val)
+    end
+
+    return rsl
+end
+
+local function skipThem()
+    while true do
+        local cur, nex = lcurr(), llookahead()
+
+        if cur == '\r' or cur == '\n' then
+            inclinenumber()
+        elseif cur == ' ' or cur == '\t' then
+            lnext()
+        elseif cur == ';' then
+            if nex == cur then
+                while lcurr() ~= '\r' and lcurr() ~= '\n' do
+                    lnext()
+                end
+                inclinenumber()
+            elseif nex == ':' then
+                while lcurr() ~= ':' or llookahead() ~= ';' do
+                    cur = lcurr()
+
+                    if cur == '\r' or cur == '\n' then
+                        inclinenumber()
+                    else
+                        lnext()
+                    end
+                end
+                lnext()
+                lnext()
+            else
+                cerror("Unexpected character ';'", rsl.row, rsl.col)
+                return rsl
+            end
+        else
+            return
         end
     end
 end
 
-local function readNext()
-    local cur = current()
-    if isQuote(cur) then
-        return readString()
-    elseif isNumber(cur, lookahead()) then
-        return readNumber()
-    else
-        return readName()
-    end
-end
+local function readList(rsl)
+    local cur = lnext()
+    local val = {}
 
-local function readList()
-    local t = {}
-    local sign = next()
-    local endSign = signs[sign]
-    while current() ~= endSign do
-        skipBad()
-        if not notEnd() then break end
-        if current() == endSign then break end
-        local c = current()
-        local v
-        if signs[c] then
-            v = readList()
-        else
-            v = readNext()
+    local sign
+
+    if cur == '(' then
+        sign = ')'
+        rsl.typ = TT_LIST
+    elseif cur == '[' then
+        sign = ']'
+        rsl.typ = TT_INDEX
+    elseif cur == '<' then
+        sign = '>'
+        rsl.typ = TT_TUPLE
+    elseif cur == '{' then
+        sign = '}'
+        rsl.typ = TT_TABLE
+    end
+
+    while lcurr() ~= sign do
+        if lcurr() == '' then
+            rsl.typ = -2
+            cerror("Expected '%s'", rsl.row, rsl.col, sign)
+            return rsl
         end
-        t[#t + 1] = v
-        if current() == endSign or false == notEnd() then break end
-        ast(isWS(current()), "Missing separate character")
+
+        skipThem()
+
+        if lcurr() == sign then break end
+
+        local tk = tkNext()
+        if abort then
+            rsl.typ = -2
+            return rsl
+        end
+
+        skipThem()
+
+        val[#val + 1] = tk
     end
-    next()
-    return makeTK(signType[sign] or TT_EMPTY, t)
+
+    rsl.val = val
+    lnext()
+
+    return rsl
 end
 
-local parse = function (s)
-    newState("(" .. s .. ")")
-    return readList()
-end
+local TOKEN_MT = {__tostring = function (self)
+    return string.format("[%d:%d] %d %s", self.row, self.col, self.typ, self.val)
+end}
 
-local index, node = 1, {}
-local lastNode = {}
+tkNext = function ()
+    while true do
+        skipThem()
 
-local function bfree(tbl)
-    for k in pairs(tbl) do
-        tbl[k] = nil
+        local rsl = setmetatable({
+            row = state.row,
+            col = state.col,
+            typ = -2,
+            val = 0,
+        }, TOKEN_MT)
+
+        local cur, nex = lcurr(), llookahead()
+
+        if cur == '' then
+            rsl.typ = TT_EOF
+            return rsl
+        elseif cur == '\'' or cur == '"' then
+            return readString(rsl)
+        elseif cur == '(' or cur == '<' or cur == '[' or cur == '{' then
+            return readList(rsl)
+        elseif (cur == '+' or cur == '-' or cur == '.') and (isNum(nex) or nex == '.') or isNum(cur) then
+            return readNumber(rsl)
+        elseif isalpha(cur) or cur == '@' then
+            return readName(rsl)
+        elseif cur == '+' or cur == '-' or cur == '*' or cur == '/' or
+               cur == '%' or cur == '^' then
+            lnext()
+            rsl.typ = TT_NAME
+            rsl.val = cur
+            return rsl
+        else
+            cerror("Unexpected character '%s'", state.row, state.col, cur)
+            return rsl
+        end
     end
-    tbl = nil
-    collectgarbage"collect"
-end
-
-local function newNode(n)
-    bfree(lastNode)
-    for k, v in pairs(node) do
-        lastNode[k] = v
-    end
-    lastNode[1] = lastNode[1] or makeTK(TT_EMPTY)
-    bfree(node)
-    node = n
-    index = 1
-end
-
-local function look()
-    local v = node[index]
-    assert(v, "Got nil")
-    return v
-end
-
-local function cAst(b, msg)
-    local tk = node[index] or node[index-1]
-    local rmsg = (msg or "Error") .. (" At Row: %d, Column: %d"):format(tk.row, tk.col)
-    assert(b, rmsg)
-end
-
-local function eat()
-    local v = look()
-    index = index + 1
-    return v
 end
 
 local binOper = {
@@ -334,66 +332,42 @@ local operPrty = {
     ['or'] = 4
 }
 
-local kwList = {
-    ["if"] = true,
-    ["while"] = true,
-    ["for"] = true,
-    ["repeat"] = true,
-    ["func"] = true,
-    ["lfunc"] = true,
-    ["localfunc"] = true,
-    ["def"] = true,
-    ["localdef"] = true,
-    ["index"] = true,
-    ["forin"] = true,
-    ["break"] = true,
-    ["return"] = true,
-    ["list"] = true,
-    ["do"] = true,
-    ["array"] = true,
-    ["_"] = true,
-}
-
 local stmtTemp = {
-    ["if"] = "if {expr} then\n {stmt}{ \nelse\n <stmt>}\n end",
-    ["while"] = "while {expr} do\n {stmt}\n end",
-    ["for"] = "for {name} = {val}, {val}{, <val>} do\n {stmt}\n end",
-    ["repeat"] = "repeat\n {stmt}\n until {expr}",
-    ["func"] = "{code} = function ({arg})\n {stmt}\n end",
-    ["lfunc"] = "local function ({arg})\n {stmt}\n end",
-    ["localfunc"] = "local {code} = function ({arg})\n {stmt}\n end",
-    ["def"] = "{code} = {code}",
-    ["localdef"] = "local {code} = {code}",
-    --["index"] = "{name}{idx}",
-    ["forin"] = "for {arg} in {name}({arg}) do\n {stmt}\n end",
+    ["if"] = "if {expr} then {stmt}{ else <stmt>} end",
+    ["match"] = "{match}",
+    ["enum"] = "{enum}",
+    ["while"] = "while {expr} do {tail} end",
+    ["for"] = "for {name} = {val}, {val}, {val} do {tail} end",
+    ["repeat"] = "repeat {stmt} until {expr}",
+    ["func"] = "{val} = function ({arg}) {tail} end",
+    ["localfunc"] = "local {val} = function ({arg}) {tail} end",
+    ["def"] = "{val} = {val}",
+    ["localdef"] = "local {val} = {val}",
+    ["forin"] = "for {arg} in {name}({arg}) do {tail} end",
     ["break"] = "break",
-    ["return"] = "return {array}",
-    --["list"] = "{list}",
-    --["array"] = "{array}",
-    ["do"] = "do\n {stmt}\n end",
-    ["_"] = "{code}({<array>})",
-    ["multdef"] = "{arg} = {array}",
-    ["multldef"] = "local {arg} = {array}",
-    ["nfunc"] = "function ({arg})\n {stmt}\n end",
+    ["return"] = "return {<tuple>}",
+    ["do"] = "do {tail} end",
+    ["multdef"] = "{arg} = {tuple}",
+    ["multldef"] = "local {arg} = {tuple}",
+    ["nfunc"] = "function ({arg}) {tail} end",
     ["inv"] = "-{expr}",
-    ["luaexpr"] = "{code}"
+    ["luaexpr"] = "{val}",
 }
 
-TEMP_TABLE = "{list}"
-TEMP_ARRAY = "{array}"
-TEMP_INDEX = "{name}{idx}"
+local TEMP_TABLE = "{list}"
+local TEMP_TUPLE = "{tuple}"
+local TEMP_INDEX = "({val}){idx}"
+local TEMP_CALL = "{val}({<tuple>})"
 
 local function isBin(c)
     return binOper[c] ~= nil
 end
 
 local function getBin(c)
-    cAst(isBin(c))
     return binOper[c]
 end
 
 local function getUnr(c)
-    cAst(not isBin(c))
     return unrOper[c]
 end
 
@@ -411,202 +385,438 @@ local function getOper(c)
 end
 
 local function copy(t)
-    local r = {}
+    local rsl = {}
     for k, v in pairs(t) do
         if type(v) == 'table' then
-            r[k] = copy(v)
+            rsl[k] = copy(v)
         else
-            r[k] = v
+            rsl[k] = v
         end
     end
-    return r
+    return rsl
 end
 
 local function isOper(c)
     return (binOper[c] or unrOper[c]) ~= nil
 end
 
-local compiler
+local curtoken
+local prilist = {}
 
-compiler = {
-    replace = function (fstr)
-        local str = fstr:sub(2, -2)
-        if str == "expr" then
-            return compiler.compileExprTo(eat())
-        elseif str == "stmt" then
-            local r = ""
-            local stmt = eat()
-            for i = 1, stmt.count do
-                r = r .. compiler.compileStmtTo(stmt[i])
-            end
-            return r
-        elseif str == "code" then
-            return compiler.compileLineTo(eat())
-        elseif str == "val" then
-            return tostring(eat().value)
-        elseif str == "name" then
-            local n = eat().value
-            cAst(n, "Need name, got code")
-            return n
-        elseif str == "arg" then
-            local tp = eat()
-            local r = {}
-            for i = 1, tp.count do
-                local n = tp[i].value
-                cAst(n, "Need name, got code")
-                r[#r + 1] = n
-            end
-            return table.concat(r, ", ")
-        elseif str == "idx" then
-            local r = {}
-            while node[index] do
-                local tk = eat()
-                local s = compiler.compileLineTo(tk)
-                if tk.type == TT_STRING or tostring(tk.value):find(" ") then
-                    s = s
-                end
-                r[#r + 1] = s
-            end
-            return "[" .. table.concat(r, "][") .. "]"
-        elseif str == "list" then
-            local r = {}
-            cAst(node.count % 2 == 0, "Too less arguments")
-            for i = 1, node.count - 1, 2 do
-                r[#r + 1] = "[\"" .. compiler.compileLineTo(node[i]) .. "\"]" .. " = " .. compiler.compileLineTo(node[i+1])
-            end
-            return table.concat(r, ", ")
-        elseif str == "array" then
-            local r = {}
-            while node[index] do
-                local tk = eat()
-                local s = compiler.compileLineTo(tk)
-                r[#r + 1] = s
-            end
-            return table.concat(r, ", ")
-        else
-            cAst(str:find("<"), "Missing code")
-            if node[index] then
-                local r = str:gsub("<[^>]+>", function (fstr)
-                    local r = compiler.replace(fstr)
-                    return r
-                end)
-                return r
-            end
-            return ""
-        end
-    end,
-    compileExprTo = function (tk)
-        local ln, n, idx = copy(lastNode), copy(node), index
-        newNode(tk)
-        local r = compiler.exprToCode()
-        lastNode = ln
-        node = n
-        index = idx
-        return r
-    end,
-    compileStmtTo = function (tk)
-        local ln, n, idx = copy(lastNode), copy(node), index
-        newNode(tk)
-        local r = compiler.stmtToCode()
-        lastNode = ln
-        node = n
-        index = idx
-        return r
-    end,
-    compileLineTo = function (tk)
-        if tk.type >= TT_LIST then
-            local ln, n, idx = copy(lastNode), copy(node), index
-            newNode(tk)
-            local r
-            if tk.type == TT_TABLE then
-                r = "{" .. compiler.split(TEMP_TABLE) .. "}"
-            elseif tk.type == TT_ARRAY then
-                r = "{" .. compiler.split(TEMP_ARRAY) .. "}"
-            elseif tk.type == TT_INDEX then
-                r = compiler.split(TEMP_INDEX)
-            else
-                local tv = tk[1].value
-                if isOper(tv) then
-                    r = compiler.exprToCode()
-                else
-                    r = compiler.stmtToCode()
-                end
-            end
-            lastNode = ln
-            node = n
-            index = idx
-            return r
-        else
-            if tk.type == TT_STRING then
-                if tk.value:find("\r\n", 1, true) then
-                    return "[=[" .. tk.value .. "]=]"
-                end
-                return "\"" .. tk.value .. "\""
-            end
-            return tk.value
-        end
-    end,
-    exprToCode = function ()
-        local sign = eat()
-        local rs = ""
-        cAst(sign.type == TT_NAME)
-        local sv = sign.value
-        if isBin(sv) then
-            local l = compiler.compileLineTo(eat())
-            local r = compiler.compileLineTo(eat())
-            rs = table.concat({l, getBin(sv), r}, ' ')
-        else
-            rs = table.concat({getUnr(sv), compiler.compileLineTo(eat())})
-        end
-        local spri = getOperPrty(getOper(sv))
-        local lpri = getOperPrty(getOper(lastNode[1].value))
-        if lpri >= spri then
-            rs = "(" .. rs .. ")"
-        end
-        return rs
-    end,
-    split = function (temp)
-        local r = temp:gsub("{[^}]+}", function (fstr)
-            local r = compiler.replace(fstr)
-            return r
-        end)
-        return r
-    end,
-    stmtToCode = function ()
-        local sign = look().value
-        local temp = stmtTemp[sign]
-        if not temp then
-            temp = stmtTemp._
-        else
-            eat()
-        end
-        local r = compiler.split(temp)
-        if sign == "list" or sign == "array" then
-            r = "{" .. r .. "}"
-        end
-        return r .. " "
-    end,
-    compile = function (str)
-        local linePos = str:find("%$", 2)
-        local luaPath = str:sub(2, (linePos or 2) - 1)
-        local rstr = str:sub(linePos + 1)
-        local n = parse(rstr)
-        local r = {}
-        for i = 1, #n do
-            r[#r + 1] = compiler.compileLineTo(n[i])
-        end
-        return table.concat(r, "\n"), luaPath
-    end,
-    compileFromFile = function (name)
-        local f = io.open(name, "r")
-        local r, path = compiler.compile(f:read"*a")
-        f:close()
-        return r, path
+local function pappendPrty(p)
+    table.insert(prilist, p)
+end
+
+local function premovePrty()
+    table.remove(prilist)
+end
+
+local function pnext()
+    local rsl = curtoken
+
+    curtoken = tkNext()
+
+    return rsl
+end
+
+local compileToken
+local compileStmt
+
+local function compileExpr(tk)
+    if tk.typ ~= TT_LIST then
+        return compileToken(tk)
     end
+
+    local list = tk.val
+    local len = #list
+    local oper = list[1].val
+    local rsl
+
+    assert(list[1].typ == TT_NAME and isOper(oper))
+
+    local realOper = getOper(oper)
+    local prty = getOperPrty(realOper)
+
+    local prtyToComp = prilist[#prilist] or 0
+    pappendPrty(prty)
+    
+    if oper == "cc" then
+        rsl = {}
+
+        for i = 2, len do
+            local part = compileToken(list[i])
+
+            if part == nil then
+                return nil
+            end
+
+            rsl[#rsl + 1] = part
+        end
+
+        rsl = table.concat(rsl, " .. ")
+    elseif len == 2 and unrOper[oper] then
+        local operand = compileToken(list[2])
+
+        if operand == nil then
+            return nil
+        end
+        rsl = ("%s%s"):format(realOper, operand)
+        
+    elseif len == 3 and binOper[oper] then
+        local left, right = compileToken(list[2]), compileToken(list[3])
+
+        if left == nil or right == nil then
+            return nil
+        end
+        rsl = ("%s %s %s"):format(left, realOper, right)
+    else
+        cerror("Incorrect argument counts", tk.row, tk.col)
+        return nil
+    end
+    
+    premovePrty()
+    if prty < prtyToComp then
+        return '(' .. rsl .. ')'
+    end
+    return rsl
+end
+
+local function compileTable(tk)
+    local rsl = {}
+    local list = tk.val
+    local cnt = #list
+    
+    if cnt % 2 ~= 0 then
+        cerror("Incorrect format", tk.row, tk.col)
+        return nil
+    end
+
+    for i = 1, cnt, 2 do
+        local kt = list[i]
+        local k, v = compileToken(kt), compileToken(list[i + 1])
+
+        if k == nil or v == nil then return nil end
+
+        if kt.typ == TT_NAME then
+            if k:sub(1, 1) == '@' then
+                k = k:sub(2)
+            else
+                k = "\"" .. k .. "\""
+            end
+        end
+
+        rsl[#rsl + 1] = "[" .. k .. "]" .. " = " .. v
+    end
+    return '{' .. table.concat(rsl, ", ") .. '}'
+end
+
+local function compileTuple(tk, init)
+    local rsl = {}
+    local len = #tk.val
+        
+    for idx = init or 1, len do
+        local part = compileToken(tk.val[idx])
+
+        if part == nil then
+            return nil
+        end
+
+        rsl[#rsl + 1] = part
+
+        idx = idx + 1
+    end
+
+    return table.concat(rsl, ", ")
+end
+
+local function compileStmtTag(idx, stmt)
+    local stmts = stmt.val
+    local len, rsl = #stmts, {}
+
+    for i = idx, len do
+        local current = stmts[i]
+
+        if current.typ == TT_LIST or current.typ == TT_INDEX or current.typ == TT_TABLE or current.typ == TT_TUPLE then
+            local head = current.val[1]
+
+            if head and head.typ == TT_NAME and isOper(head.val) then
+                local part = compileExpr(stmts[i])
+                if not part then return nil end
+    
+                rsl[#rsl + 1] = "return " .. part
+    
+                return table.concat(rsl, "; ")
+            else
+                local part = compileStmt(stmts[i])
+                if not part then return nil end
+
+                rsl[#rsl + 1] = part
+            end
+        else
+            local part = compileExpr(stmts[i])
+            if not part then return nil end
+
+            rsl[#rsl + 1] = "return " .. part
+
+            return table.concat(rsl, "; ")
+        end
+    end
+
+    return table.concat(rsl, "; ")
+end
+
+local tagTable = {
+    expr = function (idx, stmt)
+        return compileExpr(stmt.val[idx])
+    end,
+    stmt = function (idx, stmt)
+        return compileStmtTag(1, stmt.val[idx])
+    end,
+    tail = function (idx, stmt)
+        return compileStmtTag(idx, stmt)
+    end,
+    name = function (idx, stmt)
+        local tk = stmt.val[idx]
+
+        if tk.typ ~= TT_NAME then
+            cerror("Expected <name>", tk.row, tk.col)
+            return
+        end
+
+        return tk.val
+    end,
+    val = function (idx, stmt)
+        return compileToken(stmt.val[idx])
+    end,
+    arg = function (idx, stmt)
+        local argList = stmt.val[idx]
+
+        if argList.typ ~= TT_LIST then
+            cerror("Expected <list>", argList.row, argList.col)
+            return
+        end
+        argList = argList.val
+
+        local len, rsl = #argList, {}
+
+        for i = 1, len do
+            local tk = argList[i]
+
+            if tk.typ ~= TT_NAME then
+                cerror("Expected <name>", tk.row, tk.val)
+                return
+            end
+
+            rsl[#rsl + 1] = tk.val
+        end
+
+        return table.concat(rsl, ", ")
+    end,
+    list = function (idx, stmt)
+        return compileTable(stmt.val[idx])
+    end,
+    tuple = function (idx, stmt)
+        return compileTuple(stmt, idx)
+    end,
+    idx = function (idx, stmt)
+        local rsl = {}
+        local len = #stmt.val
+        
+        while idx <= len do
+            local tk = stmt.val[idx]
+            local part = compileToken(tk)
+
+            if abort then
+                return nil
+            end
+
+            if tk.typ == TT_NAME then
+                if part:sub(1, 1) == '@' then
+                    part = part:sub(2)
+                else
+                    part = "\"" .. part .. "\""
+                end
+            end
+            rsl[#rsl + 1] = part
+
+            idx = idx + 1
+        end
+
+        return "[" .. table.concat(rsl, "][") .. "]"
+    end,
 }
 
-local lua, path = compiler.compileFromFile("test.cisp")
-print(lua)
-local file = io.open(path, "w")
-file:write(lua)
-file:close()
+local function compileByTemp(temp, stmt, init)
+    local idx = init or 2
+
+    return temp:gsub("{[^}]+}", function (tag)
+        tag = tag:sub(2, -2)
+        local tagFunc = tagTable[tag]
+
+        if tagFunc then
+            if stmt.val[idx] == nil then
+                cerror("Missing argument(s)", stmt.row)
+                return nil
+            end
+
+            local rsl = tagFunc(idx, stmt)
+            idx = idx + 1
+            return rsl
+        end
+
+        local exhausted = false
+        local rsl = tag:gsub("<[^>]+>", function (subTag)
+            if not stmt.val[idx] then
+                exhausted = true
+            else
+                subTag = subTag:sub(2, -2)
+                local subTagFunc = tagTable[subTag]
+
+                assert(subTagFunc)
+                    
+                local rsl, rslIdx = subTagFunc(idx, stmt)
+                idx = rslIdx or (idx + 1)
+                return rsl
+            end
+        end)
+
+        if exhausted then
+            return ''
+        end
+        
+        return rsl
+    end)
+end
+
+function compileStmt(tk)
+    local head = tk.val[1]
+
+    if head == nil then return '' end
+
+    local temp = stmtTemp[head.val]
+
+    if isOper(head.val) or (head.typ ~= TT_NAME and head.typ ~= TT_INDEX and head.typ ~= TT_LIST) then
+        cerror("Expected <stmt>", tk.row, tk.col)
+        return nil
+    end
+
+    if temp then
+        return compileByTemp(stmtTemp[tk.val[1].val], tk)
+    end
+
+    local fakeList = {typ = TT_LIST, val = {
+        {typ = TT_NAME, val = "_", row = tk.row, col = tk.col},
+        unpack(tk.val),
+    }, row = tk.row, col = tk.col}
+
+    return compileByTemp(TEMP_CALL, fakeList)
+end
+
+local function compileList(tk)
+    if tk.typ == -2 then
+        return nil
+    elseif tk.typ ~= TT_LIST then
+        cerror("Expected <list>", tk.row)
+        return nil
+    end
+
+    local list = tk.val
+    local head = list[1]
+
+    if head == nil then return '' end
+
+    if head.typ == TT_NAME or head.typ == TT_INDEX or head.typ == TT_LIST then
+        if head.typ == TT_NAME and isOper(head.val) then
+            return compileExpr(tk), "EXPR"
+        end
+        return compileStmt(tk), "STMT"
+    else
+        cerror("Can't call the value \"%s\"", head.row, head.col, head.val)
+        return nil
+    end
+end
+
+function compileToken(tk)
+    local typ, val = tk.typ, tk.val
+
+    assert(typ ~= TT_EOF and typ ~= -2)
+
+    if typ == TT_STRING then
+        return "\"" .. val .. "\""
+    elseif typ == TT_NAME or typ == TT_NUMBER then
+        return tostring(val)
+    elseif typ == TT_LIST then
+        return compileList(tk)
+    elseif typ == TT_INDEX then
+        return compileByTemp(TEMP_INDEX, tk, 1)
+    elseif typ == TT_TABLE then
+        return compileTable(tk)
+    elseif typ == TT_TUPLE then
+        return '{' .. compileTuple(tk) .. '}'
+    end
+
+    return ''
+end
+
+local function compileProgram()
+    if not curtoken then
+        curtoken = tkNext()
+    end
+
+    local rsl = {}
+
+    while curtoken.typ ~= TT_EOF do
+        if curtoken.typ == -2 then
+            return nil
+        end
+
+        local line, typ = compileList(curtoken)
+        if typ == "EXPR" then
+            cerror("Expected statement", curtoken.row, nil)
+            return nil
+        end
+        if line == nil then
+            return nil
+        end
+
+        rsl[#rsl + 1] = line
+
+        pnext()
+    end
+
+    return table.concat(rsl, "\n")
+end
+
+local function compileFile(fn)
+    local file, err = io.open(fn, "r")
+    
+    if not file then
+        print(err)
+        return
+    end
+
+    local source = file:read"*a"
+    file:close()
+
+    local linePos = source:find("%$", 2)
+    local luaPath = source:sub(2, (linePos or 2) - 1)
+    local rstr = source:sub(linePos + 1)
+    
+    newState(rstr, fn)
+
+    local rsl = compileProgram()
+
+    if abort then
+        return
+    end
+
+    print(rsl)
+
+    file = io.open(luaPath, "w")
+    file:write(rsl)
+    file:close()
+
+    dofile(luaPath)
+end
+
+compileFile("test.cisp")

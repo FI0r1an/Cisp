@@ -565,7 +565,101 @@ local function compileStmtTag(idx, stmt)
     return table.concat(rsl, "; ")
 end
 
+local compileByTemp
+
 local tagTable = {
+    match = function (idx, stmt)
+        local list = stmt.val
+        local matchee = list[idx]
+        local rsl = {}
+        local len = #list
+
+        for i = idx + 1, len do
+            local subStmt = list[i]
+
+            if subStmt.typ == TT_LIST and #subStmt.val == 2 then
+                local expr = ''
+                local tailStmt = compileStmtTag(2, subStmt)
+                if tailStmt == nil then return end
+
+                if subStmt.val[1].val == '_' then
+                    rsl[#rsl + 1] = ' ' .. tailStmt .. ' '
+                else
+                    expr = compileExpr({
+                        typ = TT_LIST,
+                        val = {
+                            {typ = TT_NAME, val = 'eq'},
+                            matchee,
+                            subStmt.val[1]
+                        },
+                        row = subStmt.row,
+                        col = subStmt.col,
+                    })
+                    if not expr then return end
+                    rsl[#rsl + 1] = ("if %s then %s "):format(expr, tailStmt)
+                end
+            else
+                cerror("Expected (<expr> <tail>)", subStmt.row)
+                return
+            end
+
+            idx = idx + 1
+        end
+
+        return table.concat(rsl, "else") .. "end"
+    end,
+    enum = function (idx, stmt)
+        local list = stmt.val
+        local len = #list
+        local curEnumVal = 0
+        local rsl = {}
+
+        while idx <= len do
+            local cur = list[idx]
+            local part
+
+            if cur.typ == TT_NAME then
+                part = compileByTemp(stmtTemp.localdef, {
+                    typ = TT_LIST,
+                    val = {
+                        0,
+                        cur, {
+                            typ = TT_NUMBER,
+                            val = curEnumVal
+                        }
+                    },
+                    row = cur.row,
+                })
+                curEnumVal = curEnumVal + 1
+            elseif cur.typ == TT_LIST and #cur.val == 2 then
+                local id, val = cur.val[1], cur.val[2]
+
+                if val.typ ~= TT_NUMBER then
+                    cerror("Expected <number>", val.row, val.col)
+                    return
+                end
+
+                curEnumVal = val.val
+
+                part = compileByTemp(stmtTemp.localdef, {
+                    typ = TT_LIST,
+                    val = {
+                        0,
+                        id, {
+                            typ = TT_NUMBER,
+                            val = curEnumVal
+                        }
+                    },
+                })
+                curEnumVal = curEnumVal + 1
+            end
+
+            rsl[#rsl + 1] = part
+            idx = idx + 1
+        end
+
+        return table.concat(rsl, "; ")
+    end,
     expr = function (idx, stmt)
         return compileExpr(stmt.val[idx])
     end,
@@ -646,7 +740,7 @@ local tagTable = {
     end,
 }
 
-local function compileByTemp(temp, stmt, init)
+function compileByTemp(temp, stmt, init)
     local idx = init or 2
 
     return temp:gsub("{[^}]+}", function (tag)

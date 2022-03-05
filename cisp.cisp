@@ -1,0 +1,888 @@
+$test.lua$
+
+(localdef state nil)
+
+(localfunc newState (s fn)
+    (def state {
+        src s
+        fileName (or fn "*")
+        idx 1
+        row 1
+        col 1
+    })
+)
+
+(localfunc isNum (c)
+    (and (ge c '0') (le c '9'))
+)
+
+(localfunc lcurr ()
+    (ret (state.src..sub state.idx state.idx))
+)
+
+(localfunc llookahead ()
+    (localdef idx (+ state.idx 1))
+    (ret (state.src..sub idx idx))
+)
+
+(localfunc lnext ()
+    (localdef rsl (lcurr))
+    
+    (def state.idx (+ state.idx 1))
+    (def state.col (+ state.col 1))
+
+    rsl
+)
+
+(localfunc inclinenumber ()
+    (localdef cur (lcurr))
+
+    (if (or (eq cur '\r') (eq cur '\n')) (
+        (localdef nex (llookahead))
+
+        (if (and (neq cur nex) (or (eq nex '\r') (eq nex '\n')) ) (
+            (lnext)
+        ))
+
+        (lnext)
+    ))
+
+    (def state.row (+ state.row 1))
+    (def state.col 1)
+)
+
+(enum TT_STRING TT_NAME TT_NUMBER TT_LIST TT_INDEX TT_TABLE TT_TUPLE (TT_EOF -1))
+
+(localdef abort false)
+
+(localfunc cerror (msg row col __)
+    (if col (
+        (print (string.format "[%s %d:%d] %s" state.fileName row col (msg..format __)))
+    ) (
+        (print (string.format "[%s %d] %s" state.fileName row (msg..format __)))
+    ))
+
+    (def abort true)
+)
+
+(localfunc readString (rsl)
+    (multldef (val sign) "" (lnext))
+
+    (while (neq sign (lcurr))
+        (localdef cur (lcurr))
+        (if (eq cur '') (
+            (cerror "Expected '%s'" rsl.row rsl.col sign)
+            (break)
+        ))
+
+        (def val (cc val cur))
+        (if (or (eq cur '\r') (eq cur '\n')) (
+            (inclinenumber)
+        ) (
+            (lnext)
+        ))
+    )
+
+    (lnext)
+
+    (multdef (rsl.typ rsl.val) TT_STRING val)
+    rsl
+)
+
+(localfunc isalpha (c)
+    (or (eq '_' c) (or (and (ge c 'a') (le c 'z') ) (and (ge c 'A') (le c 'Z') ) ) )
+)
+
+(localdef tkNext nil)
+
+(localfunc readName (rsl)
+    (multldef (val cur meetDot) (lnext) (lcurr) false)
+
+    (while (or (or (and (ge cur '0') (le cur '9') ) (eq cur '.') ) (isalpha cur) )
+        (if meetDot (
+            (if (and (ge cur '0') (le cur '9') ) (
+                (cerror "Unexpected character '%s'" state.row state.col cur)
+                rsl
+            ))
+        ) (
+            (def meetDot false)
+        ))
+
+        (if (eq '.' cur) (
+            (def meetDot true)
+            (if (eq cur (llookahead)) (
+                (lnext)
+                (def cur ':')
+            ))
+        ))
+
+        (def val (cc val cur))
+        (lnext)
+        (def cur (lcurr))
+    )
+
+    (if (eq '__' val) (
+        (def val '...')
+    ))
+
+    (multdef (rsl.typ rsl.val) TT_NAME val)
+    rsl
+)
+
+(localfunc readNumber (rsl)
+    (multldef (val meetPoint cur) (lnext) (eq val '.') (lcurr))
+
+    (while (or (eq '.' cur) (and (ge cur '0') (le cur '9') ) )
+        (if (eq cur '.') (
+            (if meetPoint (
+                (cerror "Unexpected character '.'" state.row state.col)
+                rsl
+            ))
+            (def meetPoint true)
+        ))
+
+        (def val (cc val cur))
+        (lnext)
+        (def cur (lcurr))
+    )
+
+    (multdef (rsl.typ rsl.val) TT_NUMBER (tonumber val))
+    (if (not rsl.val) (
+        (cerror 'Unrecognized number \"%s\"' rsl.row rsl.col val)
+    ))
+    rsl
+)
+
+(localfunc skipThem ()
+    (while true
+        (multldef (cur nex) (lcurr) (llookahead))
+
+        (match cur
+            ('\r' (inclinenumber))
+            ('\n' (inclinenumber))
+            (' ' (lnext))
+            ('\t' (lnext))
+            (';' (match nex
+                (cur
+                    (while (and (neq (lcurr) '\r') (neq (lcurr) '\n' ) )
+                        (lnext)
+                    )
+                    (inclinenumber)
+                )
+                (':'
+                    (while (or (neq (lcurr) ':') (neq (llookahead) ';') )
+                        (def cur (lcurr))
+
+                        (if (or (eq cur '\r') (eq cur '\n') ) (
+                            (inclinenumber)
+                        ) (
+                            (lnext)
+                        ))
+                    )
+                    (lnext) (lnext)
+                )
+                (_
+                    (cerror "Unexpected character ';'" rsl.row rsl.col)
+                    rsl
+                )
+            ))
+            (_ (ret))
+        )
+    )
+)
+
+(localfunc readList (rsl)
+    (multldef (cur val sign) (lnext) {} nil)
+
+    (match cur
+        ('(' (def sign ')')
+            (def rsl.typ TT_LIST))
+        ('[' (def sign ']')
+            (def rsl.typ TT_INDEX))
+        ('<' (def sign '>')
+            (def rsl.typ TT_TUPLE))
+        ('{' (def sign '}')
+            (def rsl.typ TT_TABLE))
+    )
+
+    (while (neq (lcurr) sign)
+        (if (eq (lcurr) '') (
+            (def rsl.typ -2)
+            (cerror "Expected '%s'" rsl.row rsl.col sign)
+            rsl
+        ))
+        (skipThem)
+        (if (eq (lcurr) sign) ((break)))
+
+        (localdef tk (tkNext))
+        (if abort (
+            (def rsl.typ -2)
+            rsl
+        ))
+        (skipThem)
+
+        (table.insert val tk)
+    )
+
+    (def rsl.val val)
+    (lnext)
+
+    rsl
+)
+
+(localdef TOKEN_MT {
+    __tostring (nfunc (self)
+        (ret (string.format "[%d:%d] %d %s" self.row self.col self.typ self.val))
+    )
+})
+
+(def tkNext (nfunc ()
+    (while true
+        (skipThem)
+
+        (localdef rsl (setmetatable {
+            row state.row
+            col state.col
+            typ -2
+            val 0
+        } TOKEN_MT))
+
+        (multldef (cur nex) (lcurr) (llookahead))
+
+        (if (or (and (or (eq cur '+') (eq cur '-') (eq cur '.') (eq nex '.')) (isNum nex)) (isNum cur) ) (
+            (ret (readNumber rsl))
+        ))
+        (if (or (eq cur '@') (isalpha cur)) (
+            (ret (readName rsl))
+        ))
+        (if (or (eq cur '+') (eq cur '-') (eq cur '*') (eq cur '/') (eq cur '%') (eq cur '^')) (
+            (lnext)
+            (multdef (rsl.typ rsl.val) TT_NAME cur)
+            rsl
+        ))
+
+        (match cur
+            ('' (def rsl.typ TT_EOF) rsl)
+            ('\"' (ret (readString rsl)))
+            ("'" (ret (readString rsl)))
+            ('(' (ret (readList rsl)))
+            ('<' (ret (readList rsl)))
+            ('[' (ret (readList rsl)))
+            ('{' (ret (readList rsl)))
+            (_ 
+                (cerror "Unexpected character '%s'" state.row state.col cur)
+                rsl
+            )
+        )
+    )
+))
+
+(localdef binOper {
+    "+" '+'
+    "-" '-'
+    "*" '*'
+    "/" '/'
+    "%" '%'
+    "^" '^'
+    "eq" '=='
+    "neq" '~='
+    "ge" '>='
+    "gt" '>'
+    "le" '<='
+    "lt" '<'
+    "cc" '..'
+    "and" 'and'
+    "or" 'or'
+})
+
+(localdef unrOper {
+    "len" "#"
+    "not" "not"
+})
+
+(localdef operPrty {
+    '^' 10
+    'not' 9
+    '#' 9
+    '*' 8
+    '/' 8
+    '%' 8
+    '+' 7
+    '-' 7
+    '..' 6
+    '>' 5
+    '<' 5
+    '>=' 5
+    '<=' 5
+    '~=' 5
+    '==' 5
+    'and' 4
+    'or' 4
+})
+
+(localdef stmtTemp {
+    "if" "if {val} then {stmt}{ else <stmt>} end"
+    "match" "{match}"
+    "enum" "{enum}"
+    "while" "while {val} do {tail} end"
+    "for" "for {name} = {val}, {val}, {val} do {tail} end"
+    "repeat" "repeat {stmt} until {expr}"
+    "func" "{val} = function ({arg}) {tail} end"
+    "localfunc" "local {val} = function ({arg}) {tail} end"
+    "def" "{val} = {val}"
+    "localdef" "local {val} = {val}"
+    "forin" "for {arg} in {name}({arg}) do {tail} end"
+    "break" "break"
+    "ret" "return {<tuple>}"
+    "do""do {tail} end"
+    "multdef" "{arg} = {tuple}"
+    "multldef" "local {arg} = {tuple}"
+    "nfunc" "function ({arg}) {tail} end"
+    "inv" "-{expr}"
+    "luaexpr" "{val}"
+})
+
+(multldef (TEMP_TABLE TEMP_TUPLE TEMP_INDEX TEMP_CALL) "{list}" "{tuple}" "({val}){idx}" "{val}({<tuple>})")
+
+(localfunc isBin (c)
+    (neq nil [binOper @c])
+)
+
+(localfunc getBin (c)
+    [binOper @c]
+)
+
+(localfunc getUnr (c)
+    [unrOper @c]
+)
+
+(localfunc getOperPrty (c)
+    (localdef v [operPrty (or c 0)])
+    (or v -1)
+)
+
+(localfunc getOper (c)
+    (if (isBin c) (
+        (ret (getBin c))
+    ))
+    (ret (getUnr c))
+)
+
+(localfunc isOper (c)
+    (neq nil (or [binOper @c] [unrOper @c]))
+)
+
+(multldef (curtoken prilist) nil {})
+
+(localfunc pappendPrty (p)
+    (table.insert prilist p)
+)
+
+(localfunc premovePrty ()
+    (table.remove prilist)
+)
+
+(localfunc pnext ()
+    (localdef rsl curtoken)
+    (def curtoken (tkNext))
+    rsl
+)
+
+(multldef (compileToken compileStmt) nil nil)
+
+(localfunc compileExpr (tk)
+    (if (neq TT_LIST tk.typ) (
+        (ret (compileToken tk))
+    ))
+
+    (localdef list tk.val)
+    (multldef (len oper rsl) (len list) [list 1 val] nil)
+    (assert (and (isOper oper) (eq [list 1 typ] TT_NAME)))
+
+    (localdef realOper (getOper oper))
+    (localdef prty (getOperPrty realOper))
+
+    (localdef prtyToComp (or 0 [prilist (len prilist)]))
+    (pappendPrty prty)
+
+    (if (or (eq oper 'cc') (eq oper 'or') (eq oper 'and')) (
+        (def rsl {})
+
+        (for i 2 len 1
+            (localdef part (compileToken [list @i]))
+            (if (eq nil part) (
+                nil
+            ))
+            (table.insert rsl part)
+        )
+
+        (def rsl (table.concat rsl (string.format " %s " realOper) ))
+    ) (
+        (if (and [unrOper @oper] (eq len 2)) (
+            (localdef operand (compileToken [list 2]))
+            (if (eq nil operand) (
+                nil
+            ))
+            (def rsl (string.format "%s %s" realOper operand))
+        ) (
+            (if (and [binOper @oper] (eq len 3)) (
+                (multldef (left right) (compileToken [list 2]) (compileToken [list 3]))
+
+                (if (or (eq nil left) (eq nil right)) (
+                    nil
+                ))
+
+                (def rsl (string.format "%s %s %s" left realOper right))
+            ) (
+                (cerror "Incorrect argument counts" tk.row tk.col)
+                nil
+            ))
+        ))
+    ))
+
+    (premovePrty)
+    (if (le prty prtyToComp) (
+        (cc '(' rsl ')')
+    ))
+    rsl
+)
+
+(localfunc compileTable (tk)
+    (localdef rsl {})
+    (localdef list tk.val)
+    (localdef cnt (len list))
+
+    (if (neq 0 (% cnt 2)) (
+        (cerror "Incorrect format" tk.row tk.col)
+        nil
+    ))
+
+    (for i 1 cnt 2
+        (localdef kt [list @i])
+        (multldef (k v) (compileToken kt) (compileToken [list (+ i 1)]))
+
+        (if (or (eq nil k) (eq nil v)) (
+            nil
+        ))
+
+        (if (eq TT_NAME kt.typ) (
+            (if (eq '@' (k..sub 1 1)) (
+                (def k (k..sub 2))
+            ) (
+                (def k (cc '\"' k '\"'))
+            ))
+        ))
+
+        (table.insert rsl (cc '[' k ']' ' = ' v))
+    )
+
+    (cc '{' (table.concat rsl ', ') '}')
+)
+
+(localfunc compileTuple (tk init)
+    (localdef rsl {})
+    (localdef len (len tk.val))
+
+    (for idx (or init 1) len 1
+        (localdef part (compileToken [tk.val @idx]))
+
+        (if (eq part nil) (
+            nil
+        ))
+
+        (table.insert rsl part)
+        (def idx (+ 1 idx))
+    )
+
+    (ret (table.concat rsl ', '))
+)
+
+(localfunc compileStmtTag (idx stmt)
+    (localdef stmts stmt.val)
+    (multldef (len rsl) (len stmts) {})
+
+    (for i idx len 1
+        (localdef current [stmts @i])
+
+        (if (eq TT_LIST current.typ) (
+            (localdef head [current.val 1])
+
+            (if (and head (eq head.typ TT_NAME) (isOper head.val)) (
+                (localdef part (compileExpr [stmts @i]))
+                (if (not part) (
+                    nil
+                ))
+
+                (table.insert rsl (cc 'return ' part))
+                (ret (table.concat rsl '; '))
+            ) (
+                (localdef part (compileStmt [stmts @i]))
+                (if (not part) (
+                    nil
+                ))
+
+                (table.insert rsl part)
+            ))
+        ) (
+            (localdef part (compileExpr [stmts @i]))
+            (if (not part) (
+                nil
+            ))
+
+            (table.insert rsl (cc 'return ' part))
+            (ret (table.concat rsl '; '))
+        ))
+    )
+
+    (ret (table.concat rsl '; '))
+)
+
+(localdef compileByTemp nil)
+
+(localdef tagTable {
+    match (nfunc (idx stmt)
+        (localdef list stmt.val)
+        (localdef matchee [list @idx])
+        (localdef rsl {})
+        (localdef len (len list))
+
+        (for i (+ idx 1) len 1
+            (localdef subStmt [list @i])
+
+            (if (and (eq TT_LIST subStmt.typ) (ge (len subStmt.val) 2)) (
+                (localdef expr "")
+                (localdef tailStmt (compileStmtTag 2 subStmt))
+                (if (eq tailStmt nil) (
+                    nil
+                ))
+
+                (if (eq '_' [subStmt.val 1 val]) (
+                    (table.insert rsl (cc ' ' tailStmt ' '))
+                ) (
+                    (def expr (compileExpr {
+                        typ TT_LIST
+                        val <
+                            {
+                                typ TT_NAME
+                                val "eq"
+                            }
+                            matchee
+                            [subStmt.val 1]
+                        >
+                        row subStmt.row
+                        col subStmt.col
+                    }))
+                    (if (not expr) (
+                        nil
+                    ))
+                    (table.insert rsl (string.format "if %s then %s " expr tailStmt))
+                ))
+            ) (
+                (cerror "Expected (<expr> <tail>)" subStmt.row)
+                nil
+            ))
+
+            (def idx (+ idx 1))
+        )
+        (cc (table.concat rsl "else") "end")
+    )
+    enum (nfunc (idx stmt)
+        (localdef list stmt.val)
+        (multldef (len curEnumVal rsl) (len list) 0 {})
+
+        (while (le idx len)
+            (multldef (cur part) [list @idx] nil)
+
+            (if (eq TT_NAME cur.typ) (
+                (def part (compileByTemp stmtTemp.localdef {
+                    typ TT_LIST
+                    val <
+                        0 cur {
+                            typ TT_NUMBER
+                            val curEnumVal
+                        }
+                    >
+                    row cur.row
+                }))
+                (def curEnumVal (+ 1 curEnumVal))
+            ) (
+                (if (and (eq cur.typ TT_LIST) (eq 2 (len cur.val))) (
+                    (multldef (id val) [cur.val 1] [cur.val 2])
+
+                    (if (neq TT_NUMBER val.typ) (
+                        (cerror "Expected <number>" val.row val.col)
+                        nil
+                    ))
+
+                    (def curEnumVal val.val)
+
+                    (def part (compileByTemp stmtTemp.localdef {
+                        typ TT_LIST
+                        val <
+                            0 id {
+                                typ TT_NUMBER
+                                val curEnumVal
+                            }
+                        >
+                    }))
+                    (def curEnumVal (+ 1 curEnumVal))
+                ) (
+                    (cerror "Expected <name> or (<name> <value>)" cur.row)
+                    nil
+                ))
+            ))
+            
+            (table.insert rsl part)
+            (def idx (+ 1 idx))
+        )
+        
+        (ret (table.concat rsl '; '))
+    )
+    stmt (nfunc (idx stmt)
+        (ret (compileStmtTag 1 [stmt.val @idx]))
+    )
+    tail (nfunc (idx stmt)
+        (ret (compileStmtTag idx stmt))
+    )
+    name (nfunc (idx stmt)
+        (localdef tk [stmt.val @idx])
+
+        (if (neq TT_NAME tk.typ) (
+            (cerror "Expected <name>" tk.row tk.col)
+            nil
+        ))
+
+        tk.val
+    )
+    val (nfunc (idx stmt)
+        (ret (compileToken [stmt.val @idx]))
+    )
+    arg (nfunc (idx stmt)
+        (localdef argList [stmt.val @idx])
+
+        (if (neq TT_LIST argList.typ) (
+            (cerror "Expected <list>" argList.row argList.col)
+            nil
+        ))
+        (def argList argList.val)
+
+        (multldef (len rsl) (len argList) {})
+        (for i 1 len 1
+            (localdef tk [argList @i])
+
+            (if (neq TT_NAME tk.typ) (
+                (cerror "Expected <name>" tk.row tk.col)
+                nil
+            ))
+
+            (table.insert rsl tk.val)
+        )
+        (ret (table.concat rsl ', '))
+    )
+    list (nfunc (idx stmt)
+        (ret (compileTable [stmt.val @idx]))
+    )
+    tuple (nfunc (idx stmt)
+        (ret (compileTuple stmt idx))
+    )
+    idx (nfunc (idx stmt)
+        (multldef (rsl len) {} (len stmt.val))
+
+        (while (le idx len)
+            (localdef tk [stmt.val @idx])
+            (localdef part (compileToken tk))
+
+            (if abort (
+                nil
+            ))
+
+            (if (eq tk.typ TT_NAME) (
+                (if (eq '@' (part..sub 1 1)) (
+                    (def part (part..sub 2))
+                ) (
+                    (def part (cc '\"' part '\"'))
+                ))
+            ))
+            (table.insert rsl part)
+            (def idx (+ 1 idx))
+        )
+
+        (cc '[' (table.concat rsl '][') ']')
+    )
+})
+
+(def compileByTemp (nfunc (temp stmt init)
+    (localdef idx (or init 2))
+
+    (ret (temp..gsub "{[^}]+}" (nfunc (tag)
+        (def tag (tag..sub 2 -2))
+        (localdef tagFunc [tagTable @tag])
+
+        (if tagFunc (
+            (if (eq nil [stmt.val @idx]) (
+                (cerror "Missing argument(s)" stmt.row)
+                nil
+            ))
+
+            (localdef rsl (tagFunc idx stmt))
+            (def idx (+ 1 idx))
+
+            rsl
+        ))
+
+        (localdef exhausted false)
+        (localdef rsl (tag..gsub "<[^>]+>" (nfunc (subTag)
+            (if [stmt.val @idx] (
+                (def subTag (subTag..sub 2 -2))
+                (localdef subTagFunc [tagTable @subTag])
+                (assert subTagFunc)
+
+                (localdef rsl (subTagFunc idx stmt))
+                (def idx (+ 1 idx))
+                rsl
+            ) (
+                (def exhausted true)
+            ))
+        )))
+
+        (if exhausted (
+            ''
+        ))
+
+        rsl
+    )))
+))
+
+(def compileStmt (nfunc (tk)
+    (localdef head [tk.val 1])
+
+    (if (eq head nil) (''))
+    (localdef temp [stmtTemp [head val]])
+
+    (if (or (isOper head.val) (and (neq head.typ TT_NAME) (neq head.typ TT_INDEX) (neq head.typ TT_LIST))) (
+        (cerror "Expected <stmt>" tk.row tk.col)
+        nil
+    ))
+
+    (if temp (
+        (ret (compileByTemp [stmtTemp [tk.val 1 val]] tk))
+    ))
+
+    (localdef fakeList {
+        typ TT_LIST
+        val <
+            {typ TT_NAME val '_' row tk.row col tk.col}
+            (unpack tk.val)
+        >
+        row tk.row
+        col tk.col
+    })
+
+    (ret (compileByTemp TEMP_CALL fakeList))
+))
+
+(localfunc compileList (tk)
+    (if (eq -2 tk.typ) (
+        nil
+    ))
+    (if (neq TT_LIST tk.typ) (
+        (cerror "Expected <list>" tk.row)
+        nil
+    ))
+
+    (localdef list tk.val)
+    (localdef head [list 1])
+
+    (if (eq nil head) (nil))
+
+    (if (or (eq head.typ TT_NAME) (eq head.typ TT_INDEX) (eq head.typ TT_LIST)) (
+        (if (and (eq head.typ TT_NAME) (isOper head.val)) (
+            (ret (compileExpr tk) "EXPR")
+        ))
+        (ret (compileStmt tk) "STMT")
+    ) (
+        (cerror 'Cannot call the value \"%s\"' head.row head.col head.val)
+        nil
+    ))
+)
+
+(def compileToken (nfunc (tk)
+    (multldef (typ val) tk.typ tk.val)
+
+    (assert (and (neq typ TT_EOF) (neq typ -2)))
+
+    (match typ
+        (TT_STRING (cc '\"' val '\"'))
+        (TT_NAME (ret (tostring val)))
+        (TT_NUMBER (ret (tostring val)))
+        (TT_LIST (ret (compileList tk)))
+        (TT_INDEX (ret (compileByTemp TEMP_INDEX tk 1)))
+        (TT_TABLE (ret (compileTable tk)))
+        (TT_TUPLE (cc '{' (compileTuple tk) '}'))
+    )
+
+    ''
+))
+
+(localfunc compileProgram ()
+    (if (not curtoken) (
+        (def curtoken (tkNext))
+    ))
+
+    (localdef rsl {})
+    
+    (while (neq TT_EOF curtoken.typ)
+        (if (eq -2 curtoken.typ) (
+            nil
+        ))
+
+        (multldef (line typ) (compileList curtoken))
+
+        (if (eq typ "EXPR") (
+            (cerror "Expected statement" curtoken.row)
+            nil
+        ))
+        (if (eq line nil) (
+            nil
+        ))
+
+        (table.insert rsl line)
+        (pnext)
+    )
+
+    (ret (table.concat rsl '\n'))
+)
+
+(localfunc compileFile (fn)
+    (multldef (file err) (io.open fn 'r'))
+
+    (if (not file) (
+        (print err)
+        nil
+    ))
+
+    (localdef source (file..read '*a'))
+    (file..close)
+
+    (localdef linePos (source..find '%$' 2))
+    (localdef luaPath (source..sub 2 (- (or linePos 2) 1)))
+    (localdef rstr (source..sub (+ 1 linePos)))
+
+    (newState rstr fn)
+
+    (localdef rsl (compileProgram))
+
+    (if abort (
+        nil
+    ))
+
+    (print rsl)
+
+    (def file (io.open luaPath 'w'))
+    (file..write rsl)
+    (file..close)
+
+    (dofile luaPath)
+)
+
+(compileFile "backup.cisp")

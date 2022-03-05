@@ -129,6 +129,10 @@ local function readName(rsl)
         lnext()
         cur = lcurr()
     end
+
+    if val == '__' then
+        val = '...'
+    end
     
     rsl.typ = TT_NAME
     rsl.val = val
@@ -333,24 +337,24 @@ local operPrty = {
 }
 
 local stmtTemp = {
-    ["if"] = "if {expr} then {stmt}{ else <stmt>} end",
+    ["if"] = "if {val} then {stmt}{ else <stmt>} end",
     ["match"] = "{match}",
     ["enum"] = "{enum}",
-    ["while"] = "while {expr} do {tail} end",
+    ["while"] = "while {val} do {tail} end",
     ["for"] = "for {name} = {val}, {val}, {val} do {tail} end",
-    ["repeat"] = "repeat {stmt} until {expr}",
+    ["repeat"] = "repeat {stmt} until {val}",
     ["func"] = "{val} = function ({arg}) {tail} end",
     ["localfunc"] = "local {val} = function ({arg}) {tail} end",
     ["def"] = "{val} = {val}",
     ["localdef"] = "local {val} = {val}",
     ["forin"] = "for {arg} in {name}({arg}) do {tail} end",
     ["break"] = "break",
-    ["return"] = "return {<tuple>}",
+    ["ret"] = "return {<tuple>}",
     ["do"] = "do {tail} end",
     ["multdef"] = "{arg} = {tuple}",
     ["multldef"] = "local {arg} = {tuple}",
     ["nfunc"] = "function ({arg}) {tail} end",
-    ["inv"] = "-{expr}",
+    ["inv"] = "-{val}",
     ["luaexpr"] = "{val}",
 }
 
@@ -382,18 +386,6 @@ local function getOper(c)
     else
         return getUnr(c)
     end
-end
-
-local function copy(t)
-    local rsl = {}
-    for k, v in pairs(t) do
-        if type(v) == 'table' then
-            rsl[k] = copy(v)
-        else
-            rsl[k] = v
-        end
-    end
-    return rsl
 end
 
 local function isOper(c)
@@ -440,7 +432,7 @@ local function compileExpr(tk)
     local prtyToComp = prilist[#prilist] or 0
     pappendPrty(prty)
     
-    if oper == "cc" then
+    if oper == "cc" or oper == 'or' or oper == 'and' then
         rsl = {}
 
         for i = 2, len do
@@ -453,15 +445,14 @@ local function compileExpr(tk)
             rsl[#rsl + 1] = part
         end
 
-        rsl = table.concat(rsl, " .. ")
+        rsl = table.concat(rsl, (" %s "):format(realOper))
     elseif len == 2 and unrOper[oper] then
         local operand = compileToken(list[2])
 
         if operand == nil then
             return nil
         end
-        rsl = ("%s%s"):format(realOper, operand)
-        
+        rsl = ("%s %s"):format(realOper, operand)
     elseif len == 3 and binOper[oper] then
         local left, right = compileToken(list[2]), compileToken(list[3])
 
@@ -475,7 +466,7 @@ local function compileExpr(tk)
     end
     
     premovePrty()
-    if prty < prtyToComp then
+    if prty <= prtyToComp then
         return '(' .. rsl .. ')'
     end
     return rsl
@@ -536,7 +527,7 @@ local function compileStmtTag(idx, stmt)
     for i = idx, len do
         local current = stmts[i]
 
-        if current.typ == TT_LIST or current.typ == TT_INDEX or current.typ == TT_TABLE or current.typ == TT_TUPLE then
+        if current.typ == TT_LIST then
             local head = current.val[1]
 
             if head and head.typ == TT_NAME and isOper(head.val) then
@@ -577,7 +568,7 @@ local tagTable = {
         for i = idx + 1, len do
             local subStmt = list[i]
 
-            if subStmt.typ == TT_LIST and #subStmt.val == 2 then
+            if subStmt.typ == TT_LIST and #subStmt.val >= 2 then
                 local expr = ''
                 local tailStmt = compileStmtTag(2, subStmt)
                 if tailStmt == nil then return end
@@ -660,9 +651,6 @@ local tagTable = {
 
         return table.concat(rsl, "; ")
     end,
-    expr = function (idx, stmt)
-        return compileExpr(stmt.val[idx])
-    end,
     stmt = function (idx, stmt)
         return compileStmtTag(1, stmt.val[idx])
     end,
@@ -697,7 +685,7 @@ local tagTable = {
             local tk = argList[i]
 
             if tk.typ ~= TT_NAME then
-                cerror("Expected <name>", tk.row, tk.val)
+                cerror("Expected <name>", tk.row, tk.col)
                 return
             end
 
@@ -755,6 +743,7 @@ function compileByTemp(temp, stmt, init)
 
             local rsl = tagFunc(idx, stmt)
             idx = idx + 1
+
             return rsl
         end
 
@@ -768,8 +757,8 @@ function compileByTemp(temp, stmt, init)
 
                 assert(subTagFunc)
                     
-                local rsl, rslIdx = subTagFunc(idx, stmt)
-                idx = rslIdx or (idx + 1)
+                local rsl = subTagFunc(idx, stmt)
+                idx = idx + 1
                 return rsl
             end
         end)
@@ -913,4 +902,4 @@ local function compileFile(fn)
     dofile(luaPath)
 end
 
-compileFile("test.cisp")
+compileFile("cisp.cisp")
